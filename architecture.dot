@@ -1,42 +1,40 @@
 digraph G {
-  rankdir=LR; splines=true; nodesep=0.35; ranksep=0.7; fontname="Helvetica";
+  rankdir=LR; splines=true; nodesep=0.45; ranksep=0.8; fontname="Helvetica";
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#E8F0FB", color="#4A6585"];
-  edge [fontname="Helvetica", fontsize=9, color="#4A6585"];
-  labelloc=t; fontsize=18; label="Mars Cosmetics - Order & Inventory Sync (v1)";
+  edge [fontname="Helvetica", fontsize=10, color="#4A6585"];
+  labelloc=t; fontsize=18; label="Mars Cosmetics - Order & Inventory Sync (v1)\n ";
 
-  subgraph cluster_ch { label="Sales channels (inbound)"; style="rounded"; color="#A9B8CC"; fontsize=12;
-    WEB [label="Own website\nwebhook"]; NYK [label="Nykaa\nwebhook (dupes, out of order)"];
+  subgraph cluster_ch { label="Sales channels"; style="rounded"; color="#A9B8CC"; fontsize=12;
+    WEB [label="Own website\nwebhook"]; NYK [label="Nykaa webhook\n(dupes, out of order)"];
     BLK [label="Blinkit\nwebhook"]; FLK [label="Flipkart\nOrders API (poll only)"]; }
 
-  subgraph cluster_aws { label="AWS ap-south-1 - one NestJS codebase -> 3 ECS services: api | worker | scheduler"; style="rounded"; color="#A9B8CC"; fontsize=12;
+  subgraph cluster_aws { label="AWS ap-south-1: one NestJS codebase, 3 ECS services (api | worker | scheduler)"; style="rounded"; color="#A9B8CC"; fontsize=12;
     ALB [label="ALB (HTTPS)"];
-    API [label="api  (ECS, 2+ tasks)\nverify signature -> insert order_events\nack after commit | Ops API + Ops UI"];
-    ORD [label="worker: ORDER processor\nnormalize -> dedupe -> state machine\nRESERVE in ONE DB transaction\n+ recompute channel targets + ERP outbox row"];
-    PUSH [label="worker: STOCK processors\none queue + rate limiter per channel\nlatest target, absolute 'set to N'\ncoalesce | 429/timeout backoff"];
-    ERPW [label="worker: ERP processor\nsingle-flight per order, seq order\nlookup-before-create, circuit breaker"];
-    SCH [label="scheduler  (ECS, 1 task)\nFlipkart poll /2 min (+10 min overlap)\nBlinkit CSV (daily) | BC reconcile /15 min\nSWEEPER /30 s re-enqueues PENDING rows"];
-    PG [label="PostgreSQL (RDS Multi-AZ)\nSOURCE OF TRUTH\nstock, ledger, orders, inbox,\nsync state, ERP outbox", shape=cylinder, fillcolor="#E6F4EA"];
-    RED [label="Redis (ElastiCache)\nBullMQ queues + rate-limit tokens\nREBUILDABLE from PostgreSQL", shape=cylinder, fillcolor="#FFF3D9"];
-    S3 [label="S3\nBlinkit CSV archive", shape=cylinder, fillcolor="#FFF3D9"];
-    CW [label="CloudWatch (logs, metrics, alarms)
-+ Secrets Manager", fillcolor="#EFE8F7"];
+    API [label="api\nverify signature, insert order_events,\nack after commit | Ops API + UI"];
+    SCH [label="scheduler (advisory lock)\nFlipkart poll /2 min | Blinkit CSV daily\nBC reconcile /15 min | SWEEPER /30 s\n(re-enqueue PENDING, reclaim expired leases)"];
+    RED [label="Redis (ElastiCache)\nBullMQ queues + rate limiters\nrebuildable from PostgreSQL", shape=cylinder, fillcolor="#FFF3D9"];
+    PG [label="PostgreSQL (RDS Multi-AZ)\nSOURCE OF TRUTH\nstock, ledger, orders, inbox,\nchannel state, ERP outbox", shape=cylinder, fillcolor="#E6F4EA"];
+    ORD [label="worker: ORDER\nnormalize, dedupe, state machine\nRESERVE in one transaction"];
+    PUSH [label="worker: STOCK (per channel)\nlatest target, absolute set,\nsingle-flight per (channel, SKU)\nrate limit, backoff"];
+    ERPW [label="worker: ERP\nsingle-flight per order\nlookup-before-create, breaker"];
+    S3 [label="S3: Blinkit CSV", shape=cylinder, fillcolor="#FFF3D9"];
+    CW [label="CloudWatch + Secrets Manager", fillcolor="#EFE8F7"];
   }
 
   subgraph cluster_out { label="Outbound"; style="rounded"; color="#A9B8CC"; fontsize=12;
-    NAPI [label="Nykaa stock API\n1 SKU/call, 5 rps"]; FAPI [label="Flipkart stock API\n50 SKU/call, 10 rps"];
-    BAPI [label="Blinkit: daily CSV + REST\n~2% timeouts"]; WAPI [label="Website stock\n(own DB/API)"];
-    BC [label="Business Central (ERP)\ndown 1-2 h most Sundays", fillcolor="#FBE9E7"]; OPS [label="Ops team", fillcolor="#EFE8F7"]; }
+    CH [label="Channel stock APIs\nWebsite: own DB | Nykaa: 1 SKU/call, 5 rps\nFlipkart: 50 SKU/call, 10 rps\nBlinkit: daily CSV + REST (~2% timeouts)"];
+    BC [label="Business Central (ERP)\ndown 1-2 h most Sundays", fillcolor="#FBE9E7"];
+    OPS [label="Ops team", fillcolor="#EFE8F7"]; }
 
   WEB -> ALB [label="1"]; NYK -> ALB; BLK -> ALB; ALB -> API;
-  FLK -> SCH [label="1  poll", dir=both];
-  API -> PG [label="1  inbox row"]; SCH -> PG [label="1  inbox row"];
-  API -> RED [label="enqueue (best effort)", style=dashed];
-  RED -> ORD [label="2  orders queue"]; ORD -> PG [label="3  reserve txn", dir=both];
-  RED -> PUSH [label="4  per-channel queues"]; PUSH -> PG [label="read target / save ack", dir=both];
-  PUSH -> NAPI [label="5"]; PUSH -> FAPI [label="5"]; PUSH -> BAPI [label="5"]; PUSH -> WAPI [label="5"];
-  SCH -> S3 [label="CSV"]; S3 -> BAPI [style=dotted];
-  RED -> ERPW [label="6"]; ERPW -> PG [dir=both]; ERPW -> BC [label="6  create sales order"];
-  BC -> SCH [label="shipments + on-hand", style=dashed];
-  OPS -> ALB [label="failed syncs, retry"]; 
+  FLK -> SCH [label="1 poll", dir=both];
+  API -> PG [label="1 inbox row"]; SCH -> PG [label="1 inbox row"];
+  API -> RED [label="enqueue", style=dashed];
+  RED -> ORD [label="2"]; ORD -> PG [label="3 reserve txn", dir=both];
+  RED -> PUSH [label="4"]; PUSH -> PG [label="read target / ack", dir=both]; PUSH -> CH [label="5"];
+  RED -> ERPW [label="6"]; ERPW -> PG [dir=both]; ERPW -> BC [label="6 create order"];
+  SCH -> S3 [label="CSV"]; S3 -> CH [style=dotted];
+  BC -> SCH [label="shipments, on-hand", style=dashed];
+  OPS -> ALB [label="failed syncs, retry"];
   SCH -> RED [label="sweeper", style=dashed];
 }

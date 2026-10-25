@@ -1,149 +1,143 @@
 # Mars Cosmetics: Order & Inventory Sync Service (v1 design)
 
-**Stack:** Node.js / NestJS (TypeScript), PostgreSQL (RDS), Redis (ElastiCache, BullMQ), AWS ECS. **Date:** 24 Oct 2026.
+**Stack:** Node.js / NestJS (TypeScript), PostgreSQL (RDS), Redis (ElastiCache, BullMQ), AWS ECS.
 
 ![Architecture](architecture.png)
 
 ## 1. Architecture
 
-One NestJS codebase, one Docker image, **three ECS services**: `api` (webhooks, ops API, ops UI), `worker` (BullMQ processors: order, per-channel stock, ERP) and `scheduler` (Flipkart poll, Blinkit CSV, Business Central reconcile, sweeper). A modular monolith is right for 3 developers and 6 weeks; workers still scale independently.
+One NestJS codebase and image, deployed as **three ECS services**: `api` (webhooks, ops API/UI), `worker` (BullMQ processors for orders, per-channel stock, ERP) and `scheduler` (Flipkart poll, Blinkit CSV, Business Central (BC) reconcile, sweeper; one active instance via a Postgres advisory lock). A modular monolith suits 3 developers and 6 weeks, and roles still scale separately.
 
-**Principle: PostgreSQL is the only source of truth. Redis only wakes workers up.** Every unit of work (an inbox event, a stock target to push, an ERP call) is a row with a status. Jobs are enqueued after commit; a 30-second **sweeper** re-enqueues any row still `PENDING`. If Redis is lost, nothing is lost. This replaces a separate outbox relay and SQS (see trade-offs).
+**PostgreSQL is the only source of truth; Redis only wakes workers up.** Every unit of work (inbox event, stock push, ERP call) is a row with a status, a lease (`locked_until`) and an attempt count. Jobs are enqueued after commit. A 30-second **sweeper** re-enqueues `PENDING` rows and reclaims rows whose lease expired (crashed worker). Losing Redis loses nothing.
 
-**Flow:** (1) webhook is verified and written to `order_events` (poll results too), acked only after commit. (2) order processor normalizes and dedupes. (3) one DB transaction reserves stock, updates order state, writes ledger rows, recomputes channel targets and inserts the ERP outbox row. (4) stock workers push targets. (5) ERP worker creates the sales order in Business Central. (6) scheduler pulls shipments and on-hand from Business Central.
+**Flow:** (1) webhook/poll result is written to `order_events`, acked after commit. (2) order processor dedupes and applies the state machine. (3) one transaction reserves stock and writes ledger, channel accounting, targets and the ERP outbox row. (4) stock workers push targets. (5) ERP worker creates the order in BC. (6) scheduler pulls shipments and on-hand from BC.
 
-**Capacity:** peak 300 orders/min is 5/s, with about 2 lines per order. A single Postgres primary handles this easily; the hot path is one indexed `UPDATE` per line.
+Peak is 300 orders/min, about 5/s and about 10 line updates/s. One Postgres primary handles this; the hot path is one indexed `UPDATE` per line.
 
 ## 2. Data model
 
 | Table | Key columns / constraints |
 |---|---|
-| `sku_stock` | `sku` PK, `on_hand`, `reserved`, `version`, `peak_rate`; `CHECK (reserved >= 0 AND on_hand >= reserved)` |
+| `sku_stock` | `sku` PK, `on_hand`, `reserved`, `version`, `sell_rate`; `CHECK (reserved >= 0 AND on_hand >= reserved)` |
 | `orders` | `id` PK, `channel`, `external_order_id`, `status`, `source_updated_at`; **`UNIQUE(channel, external_order_id)`** |
-| `order_items` | `order_id` FK, `sku` FK, `qty`, `unit_price`; PK `(order_id, sku)` |
-| `order_events` (inbox) | `id`, `channel`, `dedupe_key`, `type`, `event_time`, raw `JSONB`, `status`; **`UNIQUE(channel, dedupe_key)`** |
-| `stock_ledger` (append-only) | `id`, `sku`, `reason` (RESERVE, RELEASE, DISPATCH, RECEIPT, ADJUST, RECONCILE), `delta_on_hand`, `delta_reserved`, before/after, `order_id`, `actor`, `ts`; **`UNIQUE(idempotency_key)`** |
-| `channel_stock_state` | PK `(channel, sku)`, `target_qty`, `target_version`, `pushed_version`, `share_qty` (null = shared mode), `status`, `attempts`, `next_attempt_at`, `last_error` |
+| `order_items` | PK `(order_id, sku)`, `qty`, `unit_price` |
+| `order_events` (inbox) | `channel`, `dedupe_key`, `type`, `event_time`, raw `JSONB`, `status`, `locked_until`, `attempts`; **`UNIQUE(channel, dedupe_key)`** |
+| `stock_ledger` (append-only) | `sku`, `reason` (RESERVE, RELEASE, DISPATCH, RECEIPT, ADJUST, RECONCILE), deltas, before/after, `order_id`, `actor`, `ts`; **`UNIQUE(idempotency_key)`** |
+| `channel_stock_state` | PK `(channel, sku)`, `mode` (SHARED/TAIL), `share_qty`, `consumed_qty`, `target_qty`, `target_version`, `computed_at`, `pushed_qty`, `pushed_version`, `status`, `locked_until`, `attempts`, `next_attempt_at`, `last_error` |
 | `stock_push_log` (append-only) | `channel`, `sku`, `qty`, `version`, `result`, `http_status`, `ts` |
-| `erp_outbox` | `order_id`, `seq`, `type` (CREATE, CANCEL), `status`, `attempts`, `erp_doc_no`, `last_error`; **`UNIQUE(order_id, seq)`** |
-| `poll_cursors` | `channel` PK, `cursor`, `updated_at` |
+| `erp_outbox` | `order_id`, `seq`, `type` (CREATE/CANCEL), `status`, `locked_until`, `attempts`, `erp_doc_no`; **`UNIQUE(order_id, seq)`** |
+| `channel_cursor` | `channel` PK, `cursor` (updated_ts, id), `observed_through` (watermark) |
 
-**Duplicate orders** are blocked in three layers: `UNIQUE(channel, dedupe_key)` on events, `UNIQUE(channel, external_order_id)` on orders, and `UNIQUE(idempotency_key)` on ledger rows (so a retried transaction cannot reserve twice). `dedupe_key` is the provider event ID if there is one, otherwise `sha256(channel | order_id | event_type | source_updated_at)`.
+**Indexes:** partial indexes on `status IN ('PENDING','RETRY')` ordered by `next_attempt_at`, and on `locked_until` for lease reclaim, for `order_events`, `channel_stock_state` and `erp_outbox`; `stock_ledger(sku, id)`.
 
-**Order states:** `RESERVED → DISPATCHED → RETURNED`; `RESERVED → CANCELLED`; `STOCK_SHORT → CANCELLED_BY_US`. Only forward transitions are applied.
+**No duplicate orders**, three layers: unique `(channel, dedupe_key)` on events (provider event ID, else `sha256(channel|order_id|type|source_updated_at)`), unique `(channel, external_order_id)` on orders, unique ledger `idempotency_key` (a retried transaction cannot reserve twice).
+
+**Order states:** `RESERVED → DISPATCHED → RETURNED`; `RESERVED → CANCELLED`; `STOCK_SHORT → CANCELLED_BY_US`. Only forward transitions apply.
 
 ## 3. Order ingestion
 
-- **Webhooks (website, Nykaa, Blinkit):** verify signature, `INSERT ... ON CONFLICT DO NOTHING` into `order_events`, return 200 after commit. If the insert fails, return 5xx so the channel retries. Enqueue is best effort; the sweeper covers misses.
-- **Flipkart polling:** every 2 minutes with a **10-minute overlap window**. Overlap is harmless because of dedupe. Persist each page before advancing the cursor; never advance past a failed page.
-- **Duplicates (Nykaa):** absorbed by the unique keys above; a duplicate is a no-op that is still acked.
-- **Out of order:** an event older than `orders.source_updated_at`, or not a forward transition, is stored and ignored. **Cancel before create:** the cancel creates an `orders` row directly in `CANCELLED`; the late `ORDER_CREATED` then sees a terminal state and reserves nothing.
-- **Channel down:** Flipkart poll failing means the cursor stays put and alerts fire. If we cannot see a channel's orders for more than 5 minutes (Flipkart lag > 5 min), that channel's **published stock for low-stock SKUs drops to 0** until it catches up, so we stop selling what we cannot see. Webhook channels that cannot reach us rely on the channel's own retry (assumption A4); our API runs on 2+ tasks across AZs.
+- **Webhooks:** verify signature, `INSERT ... ON CONFLICT DO NOTHING`, return 200 after commit; on DB failure return 5xx so the channel retries. Enqueue is best effort (sweeper backs it up).
+- **Flipkart polling:** every 2 minutes, cursor `(updated_ts, id)` with a 10-minute overlap (dedupe makes overlap harmless). Persist each page before advancing the cursor; never skip a failed page. An hourly job re-reads the last 24 h to catch late or missed orders.
+- **Duplicates (Nykaa):** no-ops, still acked. **Out of order:** events older than `source_updated_at` or non-forward are stored and ignored. **Cancel before create:** the cancel inserts the order directly as `CANCELLED`; the late create sees a terminal state and reserves nothing.
+- **Channel down:** if Flipkart's `observed_through` lags by more than 5 minutes, its published stock for tail SKUs drops to 0 until it catches up (stop selling what we cannot see). Webhook channels retry on non-2xx (A4); `api` runs 2+ tasks across AZs.
 
-## 4. Inventory consistency (the core problem)
+## 4. Inventory consistency
 
-**Key fact:** a marketplace order arrives *after* the customer bought. Reservation cannot reject it; it can only bookkeep it or flag it for cancellation. **Overselling is therefore prevented by what we publish, not by the reservation.** The reservation guarantees only that stock never goes negative and exactly one order wins the last unit.
+**Key fact:** a marketplace order arrives *after* the customer has bought, so reservation cannot reject it; it can only record it or mark it short. **Reservation is the correctness boundary** (stock never goes negative, exactly one order wins the last unit). **Overselling is prevented by what we advertise**, and a channel exceeding its advertised share is *not* rejected; only insufficient global stock is.
 
-**Reservation (hard guarantee).** One atomic conditional update per line, in sorted SKU order, all lines in one transaction:
+**Reservation transaction** (one savepoint around the whole loop, so a short order releases every line):
 
 ```text
 BEGIN
-  insert order_events ON CONFLICT DO NOTHING; if duplicate -> COMMIT (no-op)
-  o = upsert orders ... FOR UPDATE; if stale/terminal -> mark processed, COMMIT
+  insert order_events ON CONFLICT DO NOTHING; duplicate -> COMMIT
+  o = upsert orders FOR UPDATE; stale/terminal -> mark processed, COMMIT
+  SAVEPOINT reserve_order
   for line in lines sorted by sku:
     row = UPDATE sku_stock SET reserved = reserved + :q, version = version + 1
           WHERE sku = :s AND on_hand - reserved >= :q
-          RETURNING on_hand, reserved                 -- row lock serializes concurrent orders
-    if no row: ROLLBACK TO savepoint; o.status = STOCK_SHORT; insert ops alert; COMMIT
-    insert stock_ledger(RESERVE, before/after, idempotency_key = order:line:RESERVE)
-  o.status = RESERVED
-  insert erp_outbox(order_id, seq=1, CREATE)
-  recompute_targets(skus)   -- upsert channel_stock_state, bump target_version if changed
-COMMIT   -- then enqueue jobs; sweeper covers a failed enqueue
+          RETURNING on_hand, reserved           -- row lock serializes concurrent orders
+    if no row: ROLLBACK TO reserve_order; o.status = STOCK_SHORT; ops alert; COMMIT
+    insert stock_ledger(RESERVE, before/after, key = order:line:RESERVE)
+    UPDATE channel_stock_state SET consumed_qty = consumed_qty + :q
+          WHERE channel = :c AND sku = :s       -- accounting only; never rejects
+  o.status = RESERVED; insert erp_outbox(order, seq=1, CREATE)
+  recompute_targets(skus)   -- sets mode, shares, target_qty, target_version, computed_at
+COMMIT        -- then enqueue; sweeper covers a failed enqueue
 ```
 
-**What each channel is shown (the actual oversell defence).** `available = on_hand - reserved`.
+**What each channel is shown.** `available = on_hand - reserved`, `N = 4` channels, `cap` = display cap (e.g. 20).
 
-- **Healthy stock (`available > B`): shared mode.** Publish `min(display_cap, available - B)` to every channel, where **B = ceil(1.5 × sku_sell_rate × L)** and L is the worst-case lag (Flipkart: 2 min poll + processing, about 3 min). B covers what all channels can sell before they see each other's sales. Example: a SKU selling 20/min needs B ≈ 90. Display cap (e.g. 20) also means most orders do not change the pushed number at all, which matters for Nykaa (§5).
-- **Tail stock (`available <= B`): partitioned mode.** Freeze a share per channel (`share_qty`, weighted by 7-day channel sales). Each channel shows only its remaining share, so the sum of shares never exceeds real stock and **two channels cannot sell the same unit**. Shares are only lowered by that channel's own sales; units from cancellations go to a free pool and are re-partitioned only after all lowered values are acknowledged and one lag period passes. Stranding is bounded to B units per SKU.
+- **Shared mode** when `available >= B + N × cap`: every channel shows `cap`. Even if all four sell their full display, `N × cap` units go and the reserve `B` is untouched, so exposure is bounded by construction. Healthy SKUs therefore rarely need a push.
+- **`B`** is the reserve for sales we have not yet observed: `B = ceil(1.5 × sku_sell_rate × L)` with `L` the worst observation delay of any channel (Flipkart about 3 min). It is an estimate with a margin, not a proof; the hard guarantee comes from tail mode below.
+- **Tail mode** (`available < B + N × cap`): each channel gets a `share_qty`, weighted by 7-day channel sales, with **invariant `Σ remaining_share <= available`**, where `remaining_share = share_qty - consumed_qty`. A channel sells at most its share, so two channels cannot sell the same unit. If a channel's `consumed_qty` overruns its share (late order), the order is still accepted if global stock exists, and **other channels' shares are lowered immediately** in the same transaction to restore the invariant. Cancellations go to a free pool that is re-partitioned only after all lowered values are acknowledged and one lag period has passed. Stranding is bounded to `B + N × cap` units per SKU.
 
-**Last unit, two channels, same second.** `available = 1`, so the SKU is in tail mode and only Nykaa holds the share (it has the highest weight); the others show 0. The realistic failure is stale display: a website sale 30 s ago left 1 unit but pushes have not landed, so Nykaa and Flipkart both still show 1 and both sell. Orders arrive as separate events. Order A runs the conditional `UPDATE`: row lock, `1 - 0 >= 1`, success, `reserved = 1`. Order B waits for the lock, then `1 - 1 >= 1` fails, 0 rows, so B is saved as `STOCK_SHORT` with no ledger row and an ops alert. All channels are pushed 0. Ops cancels B on the channel panel (assumption A6) and it counts against the 0.5% budget. **The DB guarantees one winner and no negative stock; shared-mode buffer and tail partition keep the loser rare.**
+**Stale absolute pushes (the in-flight problem).** A marketplace may already have sold units we have not ingested; pushing "set to N" would overwrite its local decrement and re-expose them. Rules: (1) **decreases push immediately; increases (or re-pushes of an unchanged value) wait until the channel's `observed_through` is at or beyond the target's `computed_at`** (Flipkart: poll cursor; webhook channels: assumed delivery lag of 30 s, A4); (2) pushes are single-flight per `(channel, sku)` and use compare-on-`target_version`, so an old worker cannot overwrite a newer target. **Limit:** without a channel-side conditional update, unobserved sales cannot be bounded to zero, so shared mode is probabilistic and tail mode plus held increases is what we rely on for the last units. We measure the residual (§7).
 
-**Budget check:** 0.5% of 80,000 sale-day orders is 400 cancellations (last sale: about 900 units oversold). Because stale-display exposure is limited to the tail and to fast-moving SKUs with a buffer, the residual should be a small fraction of 400; measure it on the first sale (§7).
+**Last unit, two channels, same second.** `available = 1`: tail mode, Nykaa holds the only share, others show 0. The realistic failure is a stale display: a website sale 30 s ago left 1 unit and the lowering push has not yet landed, so Nykaa and Flipkart both still show 1 and both sell. Order A runs the conditional `UPDATE`: row lock, `1 - 0 >= 1`, success, `reserved = 1`. Order B waits on that lock, re-evaluates `1 - 1 >= 1`, gets 0 rows, is saved as `STOCK_SHORT` (no ledger row, ops alert); all channels are pushed 0. Ops cancels B on the channel panel (A6) and it counts against the 0.5% budget (80,000 orders × 0.5% = 400). The DB guarantees one winner and no negative stock; shared-mode reserve and tail shares keep the loser rare.
 
-**Cancel/return.** Before dispatch: release the reservation once (`UNIQUE` ledger key), enqueue ERP `CANCEL` (seq 2, processed after CREATE). Dispatch (from Business Central shipment poll): `on_hand -= q, reserved -= q`. Post-dispatch returns add to `on_hand` only after warehouse receipt is entered (ops screen or Business Central receipt), then become sellable. **Where on_hand comes from:** only ledger entries change it (DISPATCH, RECEIPT, ADJUST); a 15-minute Business Central on-hand pull is a *drift check* that writes `RECONCILE` ledger rows and alerts when drift is large.
+**Cancel/return.** Before dispatch: release once (unique ledger key) and enqueue ERP `CANCEL` (seq 2). On dispatch (BC shipment poll): `on_hand -= q, reserved -= q`. Post-dispatch returns add to `on_hand` only after a receipt is entered (ops screen or BC), then become sellable. **`on_hand` changes only via ledger entries** (DISPATCH, RECEIPT, ADJUST); a 15-minute BC on-hand pull is a drift check writing `RECONCILE` rows and alerting on large drift.
 
 ## 5. Stock push within 60 seconds
 
-Targets live in `channel_stock_state`; the queue carries only `(channel, sku)`. A worker reads the **latest** target just before sending, sends an **absolute "set to N"**, and marks `pushed_version` only on acknowledgement. Rapid changes coalesce; retries and replays are harmless. Dirty rows are picked **lowest published quantity first**, so SKUs closest to selling out go first.
+Under **normal load** the target is 60 s from ingestion to acknowledged push. The queue carries `(channel, sku)`; the worker reads the latest target, sends an absolute value, and records `pushed_version` on ack. Rapid changes coalesce (100 → 95 → 90 sends one call). Dirty rows go **lowest published quantity first**.
 
 | Channel | Limit | Operate at | Notes |
 |---|---|---|---|
-| Nykaa | 1 SKU/call, 5 rps | 4 rps = **240 SKU/min** | the bottleneck: refreshing all 1,200 SKUs takes 5 min, so full refresh is nightly only |
-| Flipkart | 50 SKU/call, 10 rps | 8 rps = 400 SKU/s | never the bottleneck; honour `Retry-After` on 429 |
-| Blinkit | REST + daily CSV, ~2% timeouts | 5 concurrent (A7) | retry same absolute value; CSV generated **just before upload** from current targets, then every row with `target_version` newer than the CSV snapshot is re-pushed by REST (avoids stale CSV overwriting urgent changes) |
-| Website | own DB | n/a | read live from `sku_stock` (no push lag) |
+| Nykaa | 1 SKU/call, 5 rps | 4 rps = **240 SKU/min** | bottleneck: a full 1,200-SKU refresh takes 5 min, so it runs nightly only |
+| Flipkart | 50/call, 10 rps | 8 rps = 400 SKU/s | never the bottleneck; honour `Retry-After` on 429 |
+| Blinkit | REST + daily CSV, ~2% timeouts | 5 concurrent (A7) | CSV is generated just before upload; afterwards every row with `target_version` newer than the CSV snapshot is re-pushed by REST |
+| Website | own DB | n/a | read live from `sku_stock` |
 
-Per-channel BullMQ queues with Redis rate limiters keep a slow channel from blocking others. Honest limit: Nykaa meets 60 s only while fewer than about 240 distinct tail SKUs change per minute; display cap and lowest-stock-first keep that true in practice, and the buffer covers the rest. Flipkart cannot meet 60 s end to end because orders are only visible via 2-minute polling; that is why L includes it in B.
+Per-channel queues and rate limiters stop a slow channel blocking others. **Saturation limit:** Nykaa holds 60 s only while fewer than about 240 distinct SKUs change per minute. Because shared mode shows a constant `cap`, only SKUs in tail mode generate Nykaa calls; on sale bursts we serve low-stock SKUs first and expose per-channel freshness (§7). Flipkart cannot meet 60 s end to end (2-minute polling); that delay is part of `L`.
 
 ## 6. Failure handling
 
 | Case | Behaviour |
 |---|---|
-| 429 | Honour `Retry-After`, re-delay the job, do not count an attempt. |
-| Timeout / 5xx (Blinkit ~2%) | Exponential backoff with jitter (2 s doubling to 5 min); the push is idempotent so a timed-out call is simply repeated. Row stays dirty. |
-| ERP Sunday downtime | `erp_outbox` rows stay `PENDING`; circuit breaker opens after N failures and probes every minute; on recovery the backlog drains through a rate limiter. Per-order ordering (CREATE before CANCEL) via `seq` and single-flight per order. A normal 2 h outage is about 700 orders; a sale-day outage up to about 36,000, so Business Central must accept 10+ orders/s (A8) or backlog drain exceeds the window. |
-| ERP exactly once | Stable external document no. `MARS-<channel>-<external_order_id>`. Before any retry, **look up by that number first, then create** (A8 requires Business Central lookup by external doc no.). At-least-once transport plus lookup plus single-flight per order gives exactly-once business effect. |
-| 4xx validation (poison) | No retry. Marked `FAILED` with the error; appears in ops screen. |
-| Retries exhausted | Stock: `FAILED`, still dirty and retried by sweeper every 5 min. ERP: retries up to 48 h, then `FAILED`. |
-| Ops screen | Lists `FAILED`/stuck rows from the DB (not from Redis). **Retry** sets status `PENDING` and enqueues; it can never create a second order or reservation because of the unique keys. Retries are logged with user ID. |
-| Isolation | Separate queue, rate limiter and breaker per channel and for ERP; a channel/ERP outage never blocks reservation. |
+| 429 | Honour `Retry-After`, delay the job, no attempt counted. |
+| Timeout / 5xx (Blinkit ~2%) | Exponential backoff with jitter (2 s doubling to 5 min). Absolute values make repeats safe. |
+| Stuck or crashed worker | Leases: `locked_until` is set when a row is taken; the sweeper reclaims expired leases (events, stock, ERP). |
+| ERP Sunday downtime | `erp_outbox` stays `PENDING`; circuit breaker opens, probes every minute; backlog drains through a rate limiter, per order in `seq` order with single-flight. A normal 2 h outage is about 700 orders; sale-day worst case about 36,000, so BC must accept 10+ orders/s (A8). |
+| ERP exactly once | Stable `MARS-<channel>-<external_order_id>` reference. We rely on BC enforcing a **unique external document number or an idempotent create (A8)**; the worker looks up before creating, and a daily outbox-vs-BC reconciliation catches any stray duplicate or missing order. Lookup alone is not enough (a timed-out create may not yet be visible). |
+| 4xx (poison) | No retry; `FAILED` with error, shown in the ops screen. |
+| Retries exhausted | Stock: `FAILED`, still retried by sweeper every 5 min. ERP: retried up to 48 h, then `FAILED`. |
+| Ops screen | Lists `FAILED`/stuck rows from Postgres. **Retry** sets `PENDING` and enqueues; unique keys make it impossible to double-create. Logged with user ID. |
+| Isolation | Queue, limiter and breaker per channel and for ERP; an outage never blocks reservation. |
 
-## 7. Observability (day one)
+## 7. Observability and validation
 
-1. **Oversell:** `STOCK_SHORT` / orders, rolling 15 min. Warn at 0.3%, page at 0.5%.
-2. **Stock freshness:** age of oldest dirty `channel_stock_state` row for tail SKUs, per channel. Warn 45 s, page 60 s. Also Flipkart poll lag > 4 min.
-3. **Ingest lag:** age of the oldest `PENDING` order event (> 30 s) and webhook 5xx rate.
-4. **ERP backlog:** `PENDING` count and oldest age. Alert at 30 min outside the Sunday window, 90 min inside.
-5. **Failures and drift:** rows in `FAILED` or exhausted, and SKUs where our `on_hand` differs from Business Central after reconcile.
+Day-one alerts: (1) `STOCK_SHORT` / orders, rolling 15 min (warn 0.3%, page 0.5%); (2) stock freshness, oldest dirty tail SKU per channel (warn 45 s, page 60 s) and Flipkart poll lag > 4 min; (3) oldest `PENDING` event > 30 s and webhook 5xx rate; (4) ERP backlog count and age (30 min normally, 90 min in the Sunday window); (5) `FAILED` rows and SKUs with BC drift.
 
 **Audit:** "why did SKU X change?" is `SELECT * FROM stock_ledger WHERE sku = X ORDER BY id`; "what did channel Y see?" is `stock_push_log`.
+
+**Validating the 0.5% target** (not claimed, to be measured): before launch, a sale-day simulation with same-SKU bursts, stale displays, Nykaa 429s, Flipkart lag and Blinkit timeouts, reporting `STOCK_SHORT / orders`. Note the units are different: last sale's 900 oversold units versus the 0.5% limit on cancelled *orders*.
 
 ## 8. Scope: left out of v1
 
 | Left out | Why |
 |---|---|
-| Second warehouse / routing | Out of brief; adds a location dimension to every stock row. Later: `(warehouse, sku)` stock and routing rules. |
+| Second warehouse | Out of brief; adds a location dimension to every stock row. |
 | Auto-cancel on marketplaces | No cancel APIs in the brief; ops cancels manually. |
-| Returns inspection workflow | Needs warehouse process we do not control; v1 takes a receipt entry only. |
-| Demand forecasting / auto-allocation tuning | Weights from 7-day sales are enough; ML is premature. |
-| LLM "why did SKU X oversell" assistant | Ledger and push log already give the answer; build after data exists. |
-| Per-line partial order handling | Order is all-or-nothing; ops decides on `STOCK_SHORT`. |
+| Returns inspection workflow | Depends on a warehouse process we do not control; v1 takes a receipt entry. |
+| Forecasting / auto-tuned allocation | 7-day sales weights are enough; ML is premature. |
+| LLM "why did SKU X oversell" assistant | Ledger and push log already answer it. |
+| Partial-line orders | Orders are all-or-nothing; ops decides on `STOCK_SHORT`. |
 
 ## 9. Assumptions
 
-- **A1** Webhooks are signed (HMAC) or token-authenticated; secrets live in Secrets Manager.
-- **A2** Every channel gives a stable order ID and a timestamp or version; a provider event ID is used when present.
-- **A3** All stock APIs accept an absolute quantity and are idempotent for the same value.
-- **A4** Nykaa and Blinkit retry webhooks on non-2xx for a reasonable period.
-- **A5** An order is "confirmed" on arrival (channels only send paid or COD-accepted orders); average 2 lines per order.
-- **A6** Marketplace cancellations are done manually by ops (no cancel API in the brief).
-- **A7** Blinkit REST has no stated rate limit; we use 5 concurrent as a conservative default.
-- **A8** Business Central supports lookup by external document number, accepts 10+ orders/s, and exposes shipments and on-hand via API.
-- **A9** SKU master (1,200 SKUs) is loaded nightly from Business Central; single warehouse; IST throughout.
-- **A10** Sale-day volume is 80,000 orders; peak 300/min.
+**A1** Webhooks signed or token-authenticated; secrets in Secrets Manager. **A2** Channels give a stable order ID and timestamp/version. **A3** Stock APIs take an absolute quantity and are idempotent for the same value. **A4** Webhook channels retry on non-2xx and deliver within about 30 s. **A5** An order is "confirmed" on arrival; average 2 lines/order; sale day 80,000 orders. **A6** Marketplace cancellations are manual. **A7** Blinkit REST has no stated limit; 5 concurrent used. **A8** BC enforces a unique external document number (or idempotent create), accepts 10+ orders/s, and exposes shipments and on-hand via API. **A9** SKU master loaded nightly from BC; one warehouse; IST.
 
 ## 10. Trade-offs
 
 | Decision | Chosen | Rejected | Why |
 |---|---|---|---|
-| Stock exposure | Shared pool minus buffer B; partition only the tail | Static per-channel allocation for all stock; same global number on every channel | Static allocation strands stock and needs constant rebalancing; the same number everywhere is what caused the 900 oversells. Tail-only partition gives a hard guarantee exactly where it matters. |
-| Reservation | Atomic conditional `UPDATE` in Postgres | Redis counter or distributed lock | Redis can lose writes on failover and drift from DB; the DB row lock is the single correctness boundary. |
-| Queueing | BullMQ on Redis + Postgres status rows + sweeper | SQS + outbox relay + DLQs | Redis is already in the stack; BullMQ gives retries, delay and rate limiting; fewer moving parts for 3 devs. Cost: Redis loss means sweeper catch-up (about 30 s), not data loss. |
-| App shape | Modular monolith, 3 ECS services | Microservices | 6 weeks / 3 developers; scaling per role is still possible. |
-| ERP delivery | Lookup-before-create + stable external doc no. + single-flight | "Exactly-once" via queue semantics | No queue gives exactly-once to a third party; receiver-side identity does. |
-| Stock updates | Absolute "set to N" with latest-target read | Delta updates | Deltas double-apply on retry and break on timeouts (Blinkit). |
+| Stock exposure | Shared constant `cap` with reserve `B`; partition only the tail | Static per-channel allocation for all stock; one global number everywhere | Static allocation strands stock; one number everywhere caused the last sale's oversell. Tail partition gives a hard guarantee where it matters. |
+| Reservation | Atomic conditional `UPDATE` in Postgres | Redis counter or distributed lock | Redis can lose writes on failover; the DB row lock is the single correctness boundary. |
+| Queueing | BullMQ + Postgres status rows + sweeper | SQS + outbox relay + DLQs | Redis is already in the stack; fewer parts for 3 devs. Cost: Redis loss means about 30 s catch-up, not data loss. |
+| App shape | Modular monolith, 3 services | Microservices | 6 weeks, 3 developers. |
+| ERP delivery | Unique external reference + lookup-before-create + reconciliation | "Exactly-once" from queue semantics | No queue gives exactly-once to a third party; receiver-side identity does. |
+| Stock updates | Absolute "set to N", increases held until watermark | Delta updates; push everything immediately | Deltas double-apply on timeouts; immediate increases can re-expose unobserved sales. |
 
-**Cost (rough, ap-south-1, ±25%, verify in AWS Pricing Calculator):** ECS Fargate ~₹10k, RDS Multi-AZ db.t4g.medium + storage ~₹12k, ElastiCache 2 small nodes ~₹5k, ALB ~₹2.5k, NAT ~₹4k, CloudWatch + S3 + Secrets ~₹5k = **about ₹40k/month**, leaving headroom for sale-day scale-out.
+**Cost (rough, ap-south-1, ±25%, verify in AWS Pricing Calculator):** ECS ~₹10k, RDS Multi-AZ ~₹12k, ElastiCache ~₹5k, ALB ~₹2.5k, NAT ~₹4k, CloudWatch/S3/Secrets ~₹5k, about **₹40k/month**.
 
-**AI usage:** ChatGPT drafted my first version; Claude reviewed it, found gaps and helped rewrite this version. I reviewed and can defend every decision.
+**AI usage:** ChatGPT drafted my first version; Claude reviewed it and helped revise this one. I reviewed and can defend every decision.
