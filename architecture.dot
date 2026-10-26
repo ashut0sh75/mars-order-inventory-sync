@@ -1,7 +1,7 @@
 digraph G {
-  rankdir=LR; splines=true; nodesep=0.45; ranksep=0.8; fontname="Helvetica";
-  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#E8F0FB", color="#4A6585"];
-  edge [fontname="Helvetica", fontsize=10, color="#4A6585"];
+  rankdir=LR; splines=true; nodesep=0.45; ranksep=0.8; fontname="Arial";
+  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=11, fillcolor="#E8F0FB", color="#4A6585"];
+  edge [fontname="Arial", fontsize=10, color="#4A6585"];
   labelloc=t; fontsize=18; label="Mars Cosmetics - Order & Inventory Sync (v1)\n ";
 
   subgraph cluster_ch { label="Sales channels"; style="rounded"; color="#A9B8CC"; fontsize=12;
@@ -11,11 +11,11 @@ digraph G {
   subgraph cluster_aws { label="AWS ap-south-1: one NestJS codebase, 3 ECS services (api | worker | scheduler)"; style="rounded"; color="#A9B8CC"; fontsize=12;
     ALB [label="ALB (HTTPS)"];
     API [label="api\nverify signature, insert order_events,\nack after commit | Ops API + UI"];
-    SCH [label="scheduler (advisory lock)\nFlipkart poll /2 min | Blinkit CSV daily\nBC reconcile /15 min | SWEEPER /30 s\n(re-enqueue PENDING, reclaim expired leases)"];
+    SCH [label="scheduler (advisory lock + heartbeat)\nFlipkart poll /2 min | Blinkit CSV daily\nBC reconcile /15 min | SWEEPER /30 s\n(re-enqueue PENDING, reclaim expired leases)"];
     RED [label="Redis (ElastiCache)\nBullMQ queues + rate limiters\nrebuildable from PostgreSQL", shape=cylinder, fillcolor="#FFF3D9"];
     PG [label="PostgreSQL (RDS Multi-AZ)\nSOURCE OF TRUTH\nstock, ledger, orders, inbox,\nchannel state, ERP outbox", shape=cylinder, fillcolor="#E6F4EA"];
     ORD [label="worker: ORDER\nnormalize, dedupe, state machine\nRESERVE in one transaction"];
-    PUSH [label="worker: STOCK (per channel)\nlatest target, absolute set,\nsingle-flight per (channel, SKU)\nrate limit, backoff"];
+    PUSH [label="worker: STOCK (per channel)\nlag-discounted target, absolute set,\nsingle-flight per (channel, SKU)\nrate limit, backoff"];
     ERPW [label="worker: ERP\nsingle-flight per order\nlookup-before-create, breaker"];
     S3 [label="S3: Blinkit CSV", shape=cylinder, fillcolor="#FFF3D9"];
     CW [label="CloudWatch + Secrets Manager", fillcolor="#EFE8F7"];
@@ -36,5 +36,5 @@ digraph G {
   SCH -> S3 [label="CSV"]; S3 -> CH [style=dotted];
   BC -> SCH [label="shipments, on-hand", style=dashed];
   OPS -> ALB [label="failed syncs, retry"];
-  SCH -> RED [label="sweeper", style=dashed];
+  SCH -> PG [label="sweeper: scan PENDING /\nexpired leases", style=dashed];
 }
